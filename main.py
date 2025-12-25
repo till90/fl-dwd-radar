@@ -441,7 +441,7 @@ def _aoi_mask_for_subset(geom_3035, out_shape: Tuple[int, int], transform: Affin
         transform=transform,
         fill=0,
         default_value=1,
-        all_touched=False,
+        all_touched=True,
         dtype=np.uint8,
     )
     return (m.astype(np.uint8) == 1)
