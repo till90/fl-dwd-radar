@@ -24,8 +24,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, timezone, timedelta
-from functools import lru_cache
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import platform
@@ -71,7 +70,6 @@ HYRAS_DAILY_BASE = os.getenv(
 # Safety
 MAX_AOI_AREA_KM2 = float(os.getenv("MAX_AOI_AREA_KM2", "25.0"))
 MAX_SUBSET_PIXELS = int(os.getenv("MAX_SUBSET_PIXELS", "2200000"))  # ~2.2 Mio for safety
-MAX_RANGE_DAYS = int(os.getenv("MAX_RANGE_DAYS", "400"))  # safety for range exports (inclusive)
 DEFAULT_MONTH = int(os.getenv("DEFAULT_MONTH", "0"))  # 0 => current month
 
 # Cache
@@ -312,7 +310,7 @@ def _find_hyras_daily_file(year: int) -> str:
     if not cands:
         raise ValueError(f"Kein HYRAS daily NetCDF für Jahr {year} gefunden in: {HYRAS_DAILY_BASE}")
 
-    # sort: prefer v6-1 over v6-0 etc
+    # sort: prefer v6-1 over v6-0 etc (lexicographic works for v6-1/v6-0, but keep safe)
     def _ver_key(fn: str) -> Tuple[int, int]:
         m = re.search(r"_v(\d+)-(\d+)_", fn)
         if not m:
@@ -343,6 +341,9 @@ def _pick_precip_variable(nc: Dataset):
             dims = getattr(v, "dimensions", ())
             if len(dims) != 3:
                 continue
+            if "time" not in dims[0].lower():
+                # often ('time','y','x')
+                pass
             vars3d.append((name, v))
         except Exception:
             continue
@@ -416,6 +417,7 @@ def _affine_for_subset(x: np.ndarray, y: np.ndarray, ys: slice, xs: slice) -> Af
         raise ValueError("Subset zu klein für Transform-Berechnung.")
 
     dx = float(np.median(np.diff(x_sub)))
+    # y can be ascending or descending
     dy_raw = float(np.median(np.diff(y_sub)))
     dy_abs = float(np.median(np.abs(np.diff(y_sub))))
 
@@ -426,7 +428,7 @@ def _affine_for_subset(x: np.ndarray, y: np.ndarray, ys: slice, xs: slice) -> Af
         top = float(y_sub[0] + dy_abs / 2.0)
         return Affine(dx, 0.0, left, 0.0, -dy_abs, top)
     else:
-        # y ascending (south->north)
+        # y ascending (south->north), unusual orientation but keep consistent
         top = float(y_sub[0] - dy_abs / 2.0)
         return Affine(dx, 0.0, left, 0.0, +dy_abs, top)
 
@@ -466,7 +468,7 @@ def _compute_month_series_hyras(gj: Dict[str, Any], year: int, month: int) -> Tu
     _http_download_file(url, local_nc, tries=3)
 
     with Dataset(str(local_nc), mode="r") as nc:
-        _, vpr = _pick_precip_variable(nc)
+        var_name, vpr = _pick_precip_variable(nc)
 
         # time
         tvar = None
@@ -475,6 +477,7 @@ def _compute_month_series_hyras(gj: Dict[str, Any], year: int, month: int) -> Tu
                 tvar = nc.variables[cand]
                 break
         if tvar is None:
+            # fallback: find first 1D var with 'since' units
             for name, vv in nc.variables.items():
                 if getattr(vv, "ndim", 0) == 1:
                     u = (getattr(vv, "units", "") or "").lower()
@@ -536,12 +539,18 @@ def _compute_month_series_hyras(gj: Dict[str, Any], year: int, month: int) -> Tu
                 out_series.append(row)
                 continue
 
+            # read subset for day
             arr = vpr[ti, ys, xs]  # netCDF4 masked array typically
+            try:
+                data = np.array(arr, dtype=np.float32)
+            except Exception:
+                data = np.array(np.ma.filled(arr, np.nan), dtype=np.float32)
+
+            # handle masked/fill
             if np.ma.isMaskedArray(arr):
                 data = np.array(np.ma.filled(arr, np.nan), dtype=np.float32)
-            else:
-                data = np.array(arr, dtype=np.float32)
 
+            # mean inside AOI
             vals = data[mask]
             vals = vals[np.isfinite(vals)]
             if vals.size == 0:
@@ -553,6 +562,7 @@ def _compute_month_series_hyras(gj: Dict[str, Any], year: int, month: int) -> Tu
                 row["status"] = "ok"
             out_series.append(row)
 
+    # stats (only ok values)
     ok_vals = [r["mean_mm"] for r in out_series if r.get("status") == "ok" and isinstance(r.get("mean_mm"), (int, float))]
     ok_vals_f = np.array(ok_vals, dtype=np.float32) if ok_vals else np.array([], dtype=np.float32)
 
@@ -581,26 +591,28 @@ def _compute_month_series_hyras(gj: Dict[str, Any], year: int, month: int) -> Tu
 # -------------------------------
 
 def _plot_calendar(year: int, month: int, series: List[Dict[str, Any]], out_png: Path) -> None:
+    # map date -> value/status
     m = {r["date"]: r for r in series}
     cal = calendar.Calendar(firstweekday=0)  # Monday
     weeks = cal.monthdayscalendar(year, month)
 
+    # compute vmax for shading (robust)
     vals = [r.get("mean_mm") for r in series if r.get("status") == "ok" and isinstance(r.get("mean_mm"), (int, float))]
     vmax = float(np.percentile(np.array(vals, dtype=np.float32), 95)) if vals else 10.0
     vmax = max(1.0, vmax)
 
-    fig = plt.figure(figsize=(12, 7), dpi=140)
+    fig_w = 12
+    fig_h = 7
+    fig = plt.figure(figsize=(fig_w, fig_h), dpi=140)
     ax = fig.add_subplot(111)
     ax.set_axis_off()
 
     title = f"Tagesniederschlag (AOI-Mittel) – {_month_name_de(month)} {year}"
     ax.text(0.0, 1.02, title, fontsize=16, fontweight="bold", transform=ax.transAxes)
-    ax.text(
-        0.0, 0.98,
-        "Einheit: mm/Tag · Werte = Flächenmittel im Polygon · HYRAS (DWD CDC) · Tage ohne Daten: n/a",
-        fontsize=10, alpha=0.75, transform=ax.transAxes
-    )
+    ax.text(0.0, 0.98, "Einheit: mm/Tag · Werte = Flächenmittel im Polygon · HYRAS (DWD CDC) · Tage ohne Daten: n/a",
+            fontsize=10, alpha=0.75, transform=ax.transAxes)
 
+    # layout grid
     n_rows = len(weeks)
     n_cols = 7
     x0, y0 = 0.02, 0.05
@@ -620,7 +632,8 @@ def _plot_calendar(year: int, month: int, series: List[Dict[str, Any]], out_png:
             cx = x0 + c * cell_w
             cy = y0 + (n_rows - 1 - r) * cell_h
 
-            face = (1, 1, 1, 0.04)
+            # background
+            face = (1, 1, 1, 0.04)  # subtle
             edge = (1, 1, 1, 0.10)
 
             label = ""
@@ -638,6 +651,7 @@ def _plot_calendar(year: int, month: int, series: List[Dict[str, Any]], out_png:
                 label = str(daynum)
 
                 if status == "ok" and isinstance(v, (int, float)):
+                    # shade by value
                     t = min(1.0, max(0.0, float(v) / vmax))
                     face = cmap(0.15 + 0.75 * t)
                     sub = f"{float(v):.1f} mm"
@@ -726,283 +740,20 @@ def _write_csv(series: List[Dict[str, Any]], out_csv: Path) -> None:
 
 
 # -------------------------------
-# Range (1/3/6/12 months or explicit)
-# -------------------------------
-
-def _parse_iso_date(s: Any) -> date:
-    if not s:
-        raise ValueError("Datum fehlt (YYYY-MM-DD).")
-    if isinstance(s, date) and not isinstance(s, datetime):
-        return s
-    if isinstance(s, str):
-        try:
-            return datetime.fromisoformat(s.strip()).date()
-        except Exception:
-            pass
-    raise ValueError(f"Ungültiges Datum: {s!r} (erwartet YYYY-MM-DD).")
-
-
-def _month_shift(year: int, month: int, delta_months: int) -> Tuple[int, int]:
-    m = month + delta_months
-    y = year
-    while m <= 0:
-        y -= 1
-        m += 12
-    while m > 12:
-        y += 1
-        m -= 12
-    return y, m
-
-
-def _period_months_to_dates(months: int, end_d: date) -> Tuple[date, date]:
-    if months not in (1, 3, 6, 12):
-        raise ValueError("months muss 1, 3, 6 oder 12 sein.")
-    sy, sm = _month_shift(end_d.year, end_d.month, -(months - 1))
-    start = date(sy, sm, 1)
-    return start, end_d
-
-
-def _iter_dates(start: date, end: date):
-    d = start
-    while d <= end:
-        yield d
-        d += timedelta(days=1)
-
-
-@lru_cache(maxsize=8)
-def _hyras_last_available_date_for_year(year: int) -> date:
-    _cleanup_cache()
-    fn = _find_hyras_daily_file(year)
-    url = HYRAS_DAILY_BASE.rstrip("/") + "/" + fn
-    local_nc = TMP_DIR / fn
-    _http_download_file(url, local_nc, tries=3)
-
-    with Dataset(str(local_nc), mode="r") as nc:
-        tvar = None
-        for cand in ("time", "TIME", "t"):
-            if cand in nc.variables:
-                tvar = nc.variables[cand]
-                break
-        if tvar is None:
-            for name, vv in nc.variables.items():
-                if getattr(vv, "ndim", 0) == 1:
-                    u = (getattr(vv, "units", "") or "").lower()
-                    if "since" in u and "day" in u:
-                        tvar = vv
-                        break
-        if tvar is None:
-            raise ValueError("Keine Zeitvariable im NetCDF gefunden (für last_available_date).")
-
-        t_units = getattr(tvar, "units", None)
-        t_cal = getattr(tvar, "calendar", "standard")
-        tvals = np.array(tvar[:])
-        dts = num2date(tvals, units=t_units, calendar=t_cal)
-        dates = [date(dt.year, dt.month, dt.day) for dt in dts]
-        if not dates:
-            raise ValueError(f"Keine Datumswerte im Jahr {year}.")
-        return max(dates)
-
-
-def _compute_range_series_hyras(
-    gj: Dict[str, Any],
-    start_d: date,
-    end_d: date,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str, float]:
-    _cleanup_cache()
-
-    if end_d < start_d:
-        raise ValueError("end_date muss >= start_date sein.")
-    n_days = (end_d - start_d).days + 1
-    if n_days > MAX_RANGE_DAYS:
-        raise ValueError(f"Zeitraum zu groß: {n_days} Tage (Limit: {MAX_RANGE_DAYS}).")
-
-    geom_wgs84 = _extract_single_geometry(gj)
-    if geom_wgs84.is_empty:
-        raise ValueError("Geometrie ist leer.")
-    if geom_wgs84.geom_type not in ("Polygon", "MultiPolygon"):
-        raise ValueError(f"Nur Polygon/MultiPolygon erlaubt (bekommen: {geom_wgs84.geom_type}).")
-
-    geom_3035 = _geom_to_epsg(geom_wgs84, 4326, HYRAS_EPSG)
-    aoi_area_km2 = float(geom_3035.area) / 1_000_000.0
-    if MAX_AOI_AREA_KM2 > 0 and aoi_area_km2 > MAX_AOI_AREA_KM2:
-        raise ValueError(f"AOI ist zu groß: {aoi_area_km2:.3f} km² (Limit: {MAX_AOI_AREA_KM2:.3f} km²).")
-
-    years = list(range(start_d.year, end_d.year + 1))
-
-    ys = xs = None
-    mask = None
-    last_avail_end_year = None
-
-    out_series: List[Dict[str, Any]] = []
-
-    for yr in years:
-        fn = _find_hyras_daily_file(yr)
-        url = HYRAS_DAILY_BASE.rstrip("/") + "/" + fn
-        local_nc = TMP_DIR / fn
-        _http_download_file(url, local_nc, tries=3)
-
-        with Dataset(str(local_nc), mode="r") as nc:
-            _, vpr = _pick_precip_variable(nc)
-
-            tvar = None
-            for cand in ("time", "TIME", "t"):
-                if cand in nc.variables:
-                    tvar = nc.variables[cand]
-                    break
-            if tvar is None:
-                for name, vv in nc.variables.items():
-                    if getattr(vv, "ndim", 0) == 1:
-                        u = (getattr(vv, "units", "") or "").lower()
-                        if "since" in u and "day" in u:
-                            tvar = vv
-                            break
-            if tvar is None:
-                raise ValueError("Keine Zeitvariable im NetCDF gefunden.")
-
-            t_units = getattr(tvar, "units", None)
-            t_cal = getattr(tvar, "calendar", "standard")
-            tvals = np.array(tvar[:])
-            dts = num2date(tvals, units=t_units, calendar=t_cal)
-            dates = [date(dt.year, dt.month, dt.day) for dt in dts]
-            date_to_idx = {d: i for i, d in enumerate(dates)}
-            last_avail = max(dates) if dates else date(yr, 12, 31)
-
-            if yr == end_d.year:
-                last_avail_end_year = last_avail
-
-            if ys is None or xs is None or mask is None:
-                minx, miny, maxx, maxy = geom_3035.bounds
-                x, y = _get_xy(nc)
-                ys2, xs2 = _subset_slices_from_bounds(x, y, (minx, miny, maxx, maxy))
-
-                y_sub = y[ys2]
-                x_sub = x[xs2]
-                h = int(y_sub.size)
-                w = int(x_sub.size)
-                if h <= 0 or w <= 0:
-                    raise ValueError("Subset leer (h/w <= 0).")
-                if (h * w) > MAX_SUBSET_PIXELS:
-                    raise ValueError(f"AOI-Subset zu groß: {h*w} Pixel (Limit: {MAX_SUBSET_PIXELS}).")
-
-                transform = _affine_for_subset(x, y, ys2, xs2)
-                mask2 = _aoi_mask_for_subset(geom_3035, (h, w), transform)
-                if int(np.sum(mask2)) <= 0:
-                    raise ValueError("AOI-Maske leer (Polygon schneidet Rasterzellen nicht).")
-
-                ys, xs, mask = ys2, xs2, mask2
-
-            y_start = max(start_d, date(yr, 1, 1))
-            y_end = min(end_d, date(yr, 12, 31))
-            year_dates = list(_iter_dates(y_start, y_end))
-
-            ti_list: List[int] = []
-            positions: List[int] = []
-
-            for d in year_dates:
-                row = {"date": d.isoformat()}
-
-                if d > last_avail:
-                    row["mean_mm"] = None
-                    row["status"] = "pending"
-                else:
-                    ti = date_to_idx.get(d)
-                    if ti is None:
-                        row["mean_mm"] = None
-                        row["status"] = "missing"
-                    else:
-                        row["mean_mm"] = None
-                        row["status"] = "calc"
-                        ti_list.append(int(ti))
-                        positions.append(len(out_series))
-
-                out_series.append(row)
-
-            if ti_list:
-                arr3 = vpr[np.array(ti_list, dtype=np.int64), ys, xs]
-                if np.ma.isMaskedArray(arr3):
-                    arr3 = np.ma.filled(arr3, np.nan)
-                data = np.array(arr3, dtype=np.float32)
-
-                vals = data[:, mask]
-                means = np.nanmean(vals, axis=1)
-
-                for pos, mm in zip(positions, means.tolist()):
-                    if mm is None or (isinstance(mm, float) and not np.isfinite(mm)):
-                        out_series[pos]["mean_mm"] = None
-                        out_series[pos]["status"] = "nodata"
-                    else:
-                        out_series[pos]["mean_mm"] = round(float(mm), 1)
-                        out_series[pos]["status"] = "ok"
-
-    if last_avail_end_year is None:
-        last_avail_end_year = end_d
-
-    last_avail_iso = last_avail_end_year.isoformat()
-
-    ok_vals = [r["mean_mm"] for r in out_series if r.get("status") == "ok" and isinstance(r.get("mean_mm"), (int, float))]
-    ok_vals_f = np.array(ok_vals, dtype=np.float32) if ok_vals else np.array([], dtype=np.float32)
-
-    def _safe(x):
-        return float(x) if np.isfinite(x) else None
-
-    stats = {
-        "count_ok": int(ok_vals_f.size),
-        "sum_mm": _safe(np.sum(ok_vals_f)) if ok_vals_f.size else None,
-        "mean_mm": _safe(np.mean(ok_vals_f)) if ok_vals_f.size else None,
-        "median_mm": _safe(np.median(ok_vals_f)) if ok_vals_f.size else None,
-        "max_mm": _safe(np.max(ok_vals_f)) if ok_vals_f.size else None,
-        "p90_mm": _safe(np.percentile(ok_vals_f, 90)) if ok_vals_f.size else None,
-        "dry_days_lt_1mm": int(np.sum(ok_vals_f < 1.0)) if ok_vals_f.size else 0,
-        "wet_days_ge_10mm": int(np.sum(ok_vals_f >= 10.0)) if ok_vals_f.size else 0,
-        "wet_days_ge_20mm": int(np.sum(ok_vals_f >= 20.0)) if ok_vals_f.size else 0,
-        "variable": "HYRAS daily precipitation (mean over AOI)",
-    }
-
-    return out_series, stats, last_avail_iso, aoi_area_km2
-
-
-def _compute_range(gj: Dict[str, Any], start_d: date, end_d: date) -> Tuple[str, Path, Path, Dict[str, Any]]:
-    series, stats, last_avail_iso, aoi_area_km2 = _compute_range_series_hyras(gj, start_d, end_d)
-
-    job_id = uuid.uuid4().hex[:12]
-    csv_path = TMP_DIR / f"{job_id}.range.csv"
-    json_path = TMP_DIR / f"{job_id}.range.json"
-
-    _write_csv(series, csv_path)
-
-    payload = {
-        "job_id": job_id,
-        "mode": "range",
-        "start_date": start_d.isoformat(),
-        "end_date": end_d.isoformat(),
-        "last_available_date": last_avail_iso,
-        "aoi_area_km2": round(aoi_area_km2, 4),
-        "series": series,
-        "stats": {**stats, "aoi_area_km2": round(aoi_area_km2, 4)},
-        "source": {
-            "dataset": "HYRAS-DE-PR daily (DWD CDC)",
-            "crs": "EPSG:3035",
-            "base_url": HYRAS_DAILY_BASE,
-        },
-    }
-    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    return job_id, csv_path, json_path, payload
-
-
-# -------------------------------
-# Compute pipeline (month report)
+# Compute pipeline
 # -------------------------------
 
 def _compute(gj: Dict[str, Any], month: int) -> ComputeResult:
     _cleanup_cache()
 
+    # current year
     now = datetime.now(timezone.utc)
     year = now.year
 
     if month < 1 or month > 12:
         raise ValueError("Monat muss 1..12 sein.")
     if month > now.month:
+        # within current year, future month
         raise ValueError(f"Monat {month} liegt in der Zukunft (aktueller Monat: {now.month}).")
 
     geom_wgs84 = _extract_single_geometry(gj)
@@ -1141,7 +892,7 @@ INDEX_HTML = """
         <b>Kalenderplot</b> (mm/Tag, AOI-Mittel) + Balken + kumuliert + Statistik.
       </div>
     </div>
-    <div class="small">API: <code>/api/compute</code> · <code>/api/range</code> · Downloads unter <code>/r/&lt;job&gt;/...</code></div>
+    <div class="small">API: <code>/api/compute</code> · Downloads unter <code>/r/&lt;job&gt;/...</code></div>
   </header>
 
   <div class="wrap">
@@ -1166,21 +917,6 @@ INDEX_HTML = """
         </div>
 
         <div id="status" class="status">Noch keine AOI.</div>
-
-        <div class="row" style="margin-top:6px;">
-          <label>Zeitraum-CSV:
-            <select id="rangeMonths">
-              <option value="1">1 Monat</option>
-              <option value="3">3 Monate</option>
-              <option value="6">6 Monate</option>
-              <option value="12">12 Monate</option>
-            </select>
-          </label>
-          <button id="btn-range-csv" disabled>CSV für Zeitraum erstellen</button>
-        </div>
-        <div class="small">
-          Exportiert tägliche AOI-Mittelwerte als CSV für die letzten N Monate (Monatsgrenzen), bis zum letzten verfügbaren HYRAS-Tag.
-        </div>
 
         <label>GeoJSON (aktuelles Feature, EPSG:4326)</label>
         <textarea id="geojson" spellcheck="false" placeholder="Hier erscheint das GeoJSON…"></textarea>
@@ -1237,9 +973,6 @@ INDEX_HTML = """
     const btnRun = document.getElementById('btn-run');
     const elMonth = document.getElementById('month');
 
-    const elRangeMonths = document.getElementById('rangeMonths');
-    const btnRangeCSV = document.getElementById('btn-range-csv');
-
     const outBox = document.getElementById('outBox');
     const statsBody = document.getElementById('statsBody');
 
@@ -1264,7 +997,6 @@ INDEX_HTML = """
 
     function setButtons(){
       btnRun.disabled = !currentFeature;
-      btnRangeCSV.disabled = !currentFeature;
     }
 
     function clearAll(){
@@ -1278,7 +1010,6 @@ INDEX_HTML = """
       btnDlCal.disabled = true;
       btnDlBars.disabled = true;
       btnDlCum.disabled = true;
-      btnRangeCSV.disabled = true;
       setButtons();
       setStatus('Noch keine AOI.', '');
     }
@@ -1390,31 +1121,6 @@ INDEX_HTML = """
       }
     });
 
-    btnRangeCSV.addEventListener('click', async () => {
-      try{
-        if(!currentFeature) return;
-
-        let gj;
-        try{ gj = JSON.parse(elGeo.value); }
-        catch(e){ setStatus('GeoJSON ist ungültig.', 'err'); return; }
-
-        const months = Number(elRangeMonths.value || 1);
-        setStatus(`Erstelle Zeitraum-CSV (${months} Monat(e))…`, '');
-
-        const data = await apiJson('/api/range', { geojson: gj, months });
-
-        const meta = data.meta || {};
-        setStatus(
-          `CSV bereit: <b>${meta.start_date}</b> bis <b>${meta.end_date}</b> · Job: <span class="mono">${data.job_id}</span>`,
-          'ok'
-        );
-
-        window.location = data.download.csv;
-      }catch(e){
-        setStatus('Fehler: ' + (e && e.message ? e.message : String(e)), 'err');
-      }
-    });
-
     clearAll();
   </script>
 </body>
@@ -1450,6 +1156,7 @@ def api_compute():
         gj = _parse_geojson(body.get("geojson"))
         month = int(body.get("month", 0) or 0)
         if month <= 0:
+            # default to current month
             month = datetime.now(timezone.utc).month
 
         rr = _compute(gj, month)
@@ -1471,60 +1178,6 @@ def api_compute():
                 "cumulative_png": f"/r/{rr.job_id}/cumulative.png",
                 "csv": f"/r/{rr.job_id}/daily.csv",
                 "json": f"/r/{rr.job_id}/result.json",
-            },
-        })
-    except Exception as e:
-        return _json_error(str(e), 400)
-
-
-@app.route("/api/range", methods=["POST", "OPTIONS"])
-def api_range():
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    try:
-        body = request.get_json(force=True, silent=False) or {}
-        gj = _parse_geojson(body.get("geojson"))
-
-        months = body.get("months", None)
-        start_s = body.get("start_date", None)
-        end_s = body.get("end_date", None)
-
-        if start_s or end_s:
-            if not start_s or not end_s:
-                raise ValueError("Wenn start_date angegeben wird, muss auch end_date angegeben werden (und umgekehrt).")
-            start_d = _parse_iso_date(start_s)
-            end_d = _parse_iso_date(end_s)
-        else:
-            m = int(months or 0)
-            if m not in (1, 3, 6, 12):
-                raise ValueError("months muss 1, 3, 6 oder 12 sein (oder nutze start_date/end_date).")
-
-            now_d = datetime.now(timezone.utc).date()
-            last_avail = _hyras_last_available_date_for_year(now_d.year)
-            end_d = min(now_d, last_avail)
-
-            # edge case: if now_d is in a new year but last_avail isn't yet updated and is < end_d
-            if last_avail < end_d:
-                end_d = last_avail
-
-            start_d, end_d = _period_months_to_dates(m, end_d)
-
-        job_id, _, _, payload = _compute_range(gj, start_d, end_d)
-
-        return jsonify({
-            "ok": True,
-            "job_id": job_id,
-            "stats": payload.get("stats", {}),
-            "meta": {
-                "start_date": payload.get("start_date"),
-                "end_date": payload.get("end_date"),
-                "last_available_date": payload.get("last_available_date"),
-                "aoi_area_km2": payload.get("aoi_area_km2"),
-            },
-            "download": {
-                "csv": f"/r/{job_id}/range.csv",
-                "json": f"/r/{job_id}/range.json",
             },
         })
     except Exception as e:
@@ -1569,22 +1222,6 @@ def dl_json(job_id: str):
     if not p.exists():
         return jsonify({"error": "Job nicht gefunden/abgelaufen."}), 404
     return send_file(p, mimetype="application/json", as_attachment=True, download_name=f"precip_result_{job_id}.json", conditional=True)
-
-
-@app.get("/r/<job_id>/range.csv")
-def dl_range_csv(job_id: str):
-    p = TMP_DIR / f"{job_id}.range.csv"
-    if not p.exists():
-        return jsonify({"error": "Job nicht gefunden/abgelaufen."}), 404
-    return send_file(p, mimetype="text/csv", as_attachment=True, download_name=f"precip_range_{job_id}.csv", conditional=True)
-
-
-@app.get("/r/<job_id>/range.json")
-def dl_range_json(job_id: str):
-    p = TMP_DIR / f"{job_id}.range.json"
-    if not p.exists():
-        return jsonify({"error": "Job nicht gefunden/abgelaufen."}), 404
-    return send_file(p, mimetype="application/json", as_attachment=True, download_name=f"precip_range_{job_id}.json", conditional=True)
 
 
 @app.get("/healthz")
