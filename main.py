@@ -671,6 +671,7 @@ def _plot_bars(year: int, month: int, series: List[Dict[str, Any]], out_png: Pat
 
     fig = plt.figure(figsize=(12, 4.2), dpi=140)
     ax = fig.add_subplot(111)
+    ax.set_xticks(xs)
     ax.set_title(f"Tageswerte (AOI-Mittel) – {_month_name_de(month)} {year}", fontsize=14, fontweight="bold")
 
     if ys:
@@ -700,6 +701,7 @@ def _plot_cumulative(year: int, month: int, series: List[Dict[str, Any]], out_pn
 
     fig = plt.figure(figsize=(12, 4.2), dpi=140)
     ax = fig.add_subplot(111)
+    ax.set_xticks(days)
     ax.set_title(f"Kumulierte Summe (AOI-Mittel) – {_month_name_de(month)} {year}", fontsize=14, fontweight="bold")
 
     if cum:
@@ -1151,21 +1153,7 @@ INDEX_HTML = """
       <div class="panel">
         <div class="row">
           <button id="btn-clear">AOI löschen</button>
-          <button class="primary" id="btn-run" disabled>Monatsreport berechnen</button>
         </div>
-
-        <div class="row">
-          <label>Monat:
-            <select id="month">
-              {% for m in months %}
-                <option value="{{ m.value }}" {% if m.value == default_month %}selected{% endif %}>{{ m.label }}</option>
-              {% endfor %}
-            </select>
-          </label>
-          <div class="small">Jahr: <b>{{ year }}</b> · Limit AOI ≤ <b>{{ max_area_km2 }} km²</b></div>
-        </div>
-
-        <div id="status" class="status">Noch keine AOI.</div>
 
         <div class="row" style="margin-top:6px;">
           <label>Zeitraum-CSV:
@@ -1181,6 +1169,24 @@ INDEX_HTML = """
         <div class="small">
           Exportiert tägliche AOI-Mittelwerte als CSV für die letzten N Monate (Monatsgrenzen), bis zum letzten verfügbaren HYRAS-Tag.
         </div>
+
+
+        <div class="row">
+          <label>Monat:
+            <select id="month">
+              {% for m in months %}
+                <option value="{{ m.value }}" {% if m.value == default_month %}selected{% endif %}>{{ m.label }}</option>
+              {% endfor %}
+            </select>
+          </label>
+            <button class="primary" id="btn-run" disabled>Monatsreport erstellen</button>
+
+          <div class="small">Jahr: <b>{{ year }}</b> · Limit AOI ≤ <b>{{ max_area_km2 }} km²</b></div>
+        </div>
+
+        <div id="status" class="status">Noch keine AOI.</div>
+
+
 
         <label>GeoJSON (aktuelles Feature, EPSG:4326)</label>
         <textarea id="geojson" spellcheck="false" placeholder="Hier erscheint das GeoJSON…"></textarea>
@@ -1594,4 +1600,4 @@ def healthz():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=True)
