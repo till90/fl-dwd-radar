@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+API:
+- POST /api/compute -> Berechnet Niederschlagsdaten für einen bestimmten Monat
+- POST /api/range -> Gibt Niederschlagsdaten für einen bestimmten Zeitraum zurück
+- GET /r/<job_id>/calendar.png -> Ruft das Kalender-PNG für einen bestimmten Job ab
+- GET /r/<job_id>/bars.png -> Ruft das Balken-PNG für einen bestimmten Job ab
+- GET /r/<job_id>/cumulative.png -> Ruft das kumulative PNG für einen bestimmten Job ab
+- GET /r/<job_id>/daily.csv -> Ruft die tägliche CSV-Datei für einen bestimmten Job ab
+- GET /r/<job_id>/result.json -> Ruft die Ergebnis-JSON-Datei für einen bestimmten Job ab
+- GET /r/<job_id>/range.csv -> Ruft die Bereichs-CSV-Datei für einen bestimmten Job ab
+- GET /r/<job_id>/range.json -> Ruft die Bereichs-JSON-Datei für einen bestimmten Job ab
+- GET /healthz -> Überprüft den Zustand des Dienstes
+"""
+"""
 fl-dwd-precip-calendar — DWD Niederschlag als Tages-Kalenderplot (AOI-Mittel)
 
 Datenquelle (empfohlen):
