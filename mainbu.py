@@ -15,7 +15,7 @@ Cloud Run:
 - Single-file Flask app, nutzt /tmp Cache.
 """
 
-from __future__ import annotations
+
 
 import calendar
 import json
